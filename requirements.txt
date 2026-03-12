@@ -1,4 +1,0 @@
-aiogram
-beautifulsoup4
-requests
-apscheduler
