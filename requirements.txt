@@ -1,0 +1,7 @@
+aiogram 
+aiosqlite
+aiohttp 
+beautifulsoup4 
+requests 
+pytz 
+apscheduler
