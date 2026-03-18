@@ -5,8 +5,9 @@ import datetime
 import pytz
 import aiosqlite
 import aiohttp
+import pandas as pd
 from bs4 import BeautifulSoup
-
+from aiogram import BaseMiddleware
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
@@ -22,7 +23,9 @@ if os.path.exists('/data'):
     DB_NAME = '/data/schedule.db'
 else:
     DB_NAME = 'schedule.db'
+ADMIN_ID = 8529027886
 BASE_URL = "https://akademiks.urtt.ru/lk/all-schedules/student/"
+CONSULTATION_URL = "https://docs.google.com/spreadsheets/d/1xKpaWPKBcv-emcRpAfYRCK767D8dLiYnJjnzvOgBies/htmlview"
 TZ_EKB = pytz.timezone('Asia/Yekaterinburg')
 
 ALL_GROUPS = [
@@ -53,6 +56,7 @@ scheduler = AsyncIOScheduler()
 class UserState(StatesGroup):
     choosing_group = State()
     waiting_for_cabinet = State()
+    waiting_for_teacher = State()
 
 # ==========================================
 # 2. УМНАЯ НОРМАЛИЗАЦИЯ ДАННЫХ
@@ -83,9 +87,16 @@ async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''CREATE TABLE IF NOT EXISTS users 
                             (telegram_id INTEGER PRIMARY KEY, group_name TEXT, notifications INTEGER DEFAULT 1)''')
+        
+        # Пытаемся добавить новую колонку. Если она уже есть, просто игнорируем ошибку.
+        try:
+            await db.execute('ALTER TABLE users ADD COLUMN last_active_date TEXT')
+        except aiosqlite.OperationalError:
+            pass # Колонка уже существует
+
         await db.execute('''CREATE TABLE IF NOT EXISTS schedule 
                             (group_name TEXT, day_name TEXT, lesson_num TEXT, time_str TEXT, subject TEXT, cabinet TEXT, teacher TEXT)''')
-        # Индексы для сверхбыстрого поиска
+        # Индексы
         await db.execute('CREATE INDEX IF NOT EXISTS idx_group_day ON schedule(group_name, day_name)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_cabinet ON schedule(cabinet, day_name)')
         await db.commit()
@@ -135,12 +146,11 @@ def parse_html_to_lessons(html, group_name):
     return lessons
 
 async def fetch_and_update_all():
-    """Фоновая задача: параллельно качает все 80+ групп и обновляет БД"""
+    """Фоновая задача: параллельно качает все группы, ищет КОНКРЕТНЫЕ изменения и обновляет БД"""
     start_time = datetime.datetime.now(TZ_EKB)
     print(f"[{start_time.strftime('%H:%M:%S')}] 🔄 Начинаю параллельный парсинг всех групп...")
     
     all_new_lessons = []
-    # Semaphore ограничивает одновременные запросы до 15, чтобы не положить сервер колледжа
     sem = asyncio.Semaphore(15) 
     
     async def fetch_group(session, group):
@@ -162,45 +172,170 @@ async def fetch_and_update_all():
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         
-        # 1. Получаем старое расписание для сравнения
+        # 1. Получаем старое расписание
         async with db.execute("SELECT * FROM schedule") as cursor:
             old_rows = await cursor.fetchall()
-            # Группируем старые данные по группам для удобного сравнения
-            old_data = {g: [] for g in ALL_GROUPS}
-            for r in old_rows:
-                old_data[r['group_name']].append((r['group_name'], r['day_name'], r['lesson_num'], r['time_str'], r['subject'], r['cabinet'], r['teacher']))
+            
+        # Группируем старые данные в словари для быстрого поиска конкретной пары
+        # Формат: old_data['is-326'][('понедельник', '1')] = row
+        old_data = {g: {} for g in ALL_GROUPS}
+        for r in old_rows:
+            old_data[r['group_name']][(r['day_name'], r['lesson_num'])] = r
 
-        # Группируем новые данные
-        new_data = {g: [] for g in ALL_GROUPS}
+        # Группируем новые данные аналогичным образом
+        # Формат: new_data['is-326'][('понедельник', '1')] = кортеж_данных
+        new_data = {g: {} for g in ALL_GROUPS}
         for r in all_new_lessons:
-            new_data[r[0]].append(r)
+            # r[0] = group, r[1] = day, r[2] = lesson_num
+            new_data[r[0]][(r[1], r[2])] = r
 
-        # 2. Ищем изменения и обновляем базу
-        changed_groups = []
-        for group in ALL_GROUPS:
-            if set(old_data[group]) != set(new_data[group]):
-                changed_groups.append(group)
-                await db.execute("DELETE FROM schedule WHERE group_name = ?", (group,))
-                await db.executemany(
-                    "INSERT INTO schedule (group_name, day_name, lesson_num, time_str, subject, cabinet, teacher) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                    new_data[group]
-                )
-        await db.commit()
+        changed_groups_count = 0
         
-        # 3. Рассылаем уведомления
-        if old_rows and changed_groups: # Не шлем при самом первом запуске
-            for group in changed_groups:
-                async with db.execute("SELECT telegram_id FROM users WHERE group_name = ? AND notifications = 1", (group,)) as cursor:
-                    users = await cursor.fetchall()
-                    for (uid,) in users:
-                        try: 
-                            _, ru_name = normalize_group(group)
-                            await bot.send_message(uid, f"🚨 *Внимание!*\nРасписание группы *{ru_name}* изменилось!", parse_mode="Markdown")
-                        except Exception: pass
+        # 2. Ищем ТОЧНЫЕ изменения для каждой группы
+        for group in ALL_GROUPS:
+            changes_text = []
+            
+            old_group_schedule = old_data[group]
+            new_group_schedule = new_data[group]
+            
+            # А. Проверяем добавленные и измененные пары
+            for key, new_lesson in new_group_schedule.items():
+                day, num = key
+                # Распаковываем кортеж: (group, day, num, time_str, subject, cabinet, teacher)
+                _, _, _, new_time, new_subj, new_cab, new_tchr = new_lesson
+                
+                if key in old_group_schedule:
+                    old_lesson = old_group_schedule[key]
+                    diffs = []
+                    
+                    # Поштучно ищем отличия
+                    if old_lesson['subject'] != new_subj:
+                        diffs.append(f"📖 Предмет: {old_lesson['subject']} ➡️ *{new_subj}*")
+                    if old_lesson['cabinet'] != new_cab:
+                        diffs.append(f"🚪 Кабинет: {old_lesson['cabinet']} ➡️ *{new_cab}*")
+                    if old_lesson['teacher'] != new_tchr:
+                        diffs.append(f"👤 Препод: {old_lesson['teacher']} ➡️ *{new_tchr}*")
+                    if old_lesson['time_str'] != new_time:
+                        diffs.append(f"⏰ Время: {old_lesson['time_str']} ➡️ *{new_time}*")
+                        
+                    if diffs:
+                        changes_text.append(f"📍 *{day.capitalize()}*, {num} пара:\n" + "\n".join(diffs))
+                else:
+                    # Ключа нет в старом расписании — добавили новую пару
+                    changes_text.append(f"➕ *{day.capitalize()}*, {num} пара: Добавлена новая!\n📖 {new_subj} (Каб: {new_cab})")
+            
+            # Б. Проверяем удаленные (отмененные) пары
+            for key, old_lesson in old_group_schedule.items():
+                if key not in new_group_schedule:
+                    day, num = key
+                    changes_text.append(f"➖ *{day.capitalize()}*, {num} пара: Отменена!\n📖 Было: {old_lesson['subject']}")
+            
+            # Если для группы нашлись изменения:
+            if changes_text or (set(old_group_schedule.keys()) != set(new_group_schedule.keys())):
+                changed_groups_count += 1
+                
+                # Обновляем БД (удаляем старое, пишем полностью новое для этой группы)
+                await db.execute("DELETE FROM schedule WHERE group_name = ?", (group,))
+                records_to_insert = list(new_group_schedule.values())
+                if records_to_insert:
+                    await db.executemany(
+                        "INSERT INTO schedule (group_name, day_name, lesson_num, time_str, subject, cabinet, teacher) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                        records_to_insert
+                    )
+                
+                # Рассылаем уведомления пользователям этой группы
+                if old_rows and changes_text: # Не рассылаем, если это самый первый запуск (когда старой БД вообще не было)
+                    current_time = datetime.datetime.now(TZ_EKB)
+                    current_day = current_time.weekday()
+                    current_hour = current_time.hour
+                    if current_day == 6 or (current_day == 5 and current_hour >= 18):
+                        continue
+                    async with db.execute("SELECT telegram_id FROM users WHERE group_name = ? AND notifications = 1", (group,)) as cursor:
+                        users = await cursor.fetchall()
+                        for (uid,) in users:
+                            try: 
+                                _, ru_name = normalize_group(group)
+                                msg_text = f"🚨 *Внимание!*\nВ расписании *{ru_name}* произошли изменения:\n\n" + "\n\n".join(changes_text)
+                                
+                                # Защита от ошибки Telegram (если изменений слишком много, режем текст)
+                                if len(msg_text) > 4000:
+                                    msg_text = msg_text[:4000] + "\n\n... (изменений слишком много)"
+                                    
+                                await bot.send_message(uid, msg_text, parse_mode="Markdown")
+                            except Exception: pass
+
+        await db.commit()
 
     seconds = (datetime.datetime.now(TZ_EKB) - start_time).total_seconds()
-    print(f"✅ Парсинг завершен за {seconds:.1f} сек. Обновлено групп: {len(changed_groups)}")
+    print(f"✅ Парсинг завершен за {seconds:.1f} сек. Изменено групп: {changed_groups_count}")
 
+async def fetch_consultations(teacher_query: str):
+    """Ищет консультации по фамилии преподавателя (используя pandas для парсинга CSV)"""
+    sheet_id = "1xKpaWPKBcv-emcRpAfYRCK767D8dLiYnJjnzvOgBies"
+    gid = "942604599"
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+    try:
+        # Для асинхронности лучше запускать синхронный pandas в отдельном потоке, 
+        # но для небольшого файла можно оставить и так.
+        df = pd.read_csv(export_url, header=None)
+    except Exception as e:
+        return f"Ошибка при скачивании таблицы: {e}"
+
+    days_of_week = df.iloc[0, 3:9].values
+    dates = df.iloc[1, 3:9].values
+
+    found_consultations = []
+    teacher_query_lower = teacher_query.lower().strip()
+
+    # Парсим всю таблицу
+    for i in range(2, len(df) - 1, 2):
+        row_time = df.iloc[i]
+        row_room = df.iloc[i+1]
+        
+        teacher = row_time[1]
+        
+        if pd.isna(teacher):
+            continue
+            
+        # Сразу проверяем, совпадает ли фамилия, чтобы не парсить лишнее
+        if teacher_query_lower in str(teacher).lower():
+            for col_idx in range(3, 9):
+                time = row_time[col_idx]
+                room = row_room[col_idx]
+                
+                if pd.notna(time):
+                    found_consultations.append({
+                        'teacher': str(teacher).strip(),
+                        'day': f"{str(dates[col_idx-3]).strip()} ({str(days_of_week[col_idx-3]).strip()})",
+                        'time': str(time).strip(),
+                        'cabinet': str(room).strip() if pd.notna(room) else "Не указан"
+                    })
+                    
+    return found_consultations
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: types.Update, data: dict):
+        # Нас интересуют только входящие сообщения от пользователей
+        if event.message and event.message.from_user:
+            user_id = event.message.from_user.id
+            # Берем текущую дату по Екатеринбургу (только дату, без времени)
+            today_str = datetime.datetime.now(TZ_EKB).strftime("%Y-%m-%d")
+            
+            # Записываем активность в фоне, не блокируя работу бота
+            async with aiosqlite.connect(DB_NAME) as db:
+                # Обновляем дату только если юзер уже есть в базе (зареган)
+                await db.execute(
+                    "UPDATE users SET last_active_date = ? WHERE telegram_id = ?", 
+                    (today_str, user_id)
+                )
+                await db.commit()
+                
+        # Передаем управление дальше, хендлерам
+        return await handler(event, data)
+
+# Регистрируем middleware
+dp.update.middleware(ActivityMiddleware())
 # ==========================================
 # 5. ХЕНДЛЕРЫ И ЛОГИКА ТЕЛЕГРАМ
 # ==========================================
@@ -216,8 +351,10 @@ async def get_main_keyboard(user_id):
     b.button(text="🚪 Поиск по кабинету")
     b.button(text="🔕 Выключить уведомления" if notif_status else "🔔 Включить уведомления")
     b.button(text="⚙️ Сменить группу")
-    b.adjust(2, 2, 1)
+    b.button(text="🧑‍🏫 Консультации")
+    b.adjust(2, 2, 1, 1)
     return b.as_markup(resize_keyboard=True)
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -231,6 +368,22 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await message.answer("Привет! Напиши свою группу (например: *ис-326*):", parse_mode="Markdown")
         await state.set_state(UserState.choosing_group)
+
+# --- АДМИН-ПАНЕЛЬ (Онлайн) ---
+@dp.message(Command("online"))
+async def cmd_online(message: types.Message):
+    if message.from_user.id != ADMIN_ID: # Не забудь убедиться, что переменная ADMIN_ID задана в начале кода!
+        return 
+
+    # Какая дата сегодня по Екб?
+    today_str = datetime.datetime.now(TZ_EKB).strftime("%Y-%m-%d")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Считаем, сколько юзеров имеют сегодняшнюю дату в колонке last_active_date
+        async with db.execute("SELECT COUNT(*) FROM users WHERE last_active_date = ?", (today_str,)) as cursor:
+            dau_count = (await cursor.fetchone())[0]
+
+    await message.answer(f"📈 *Online (DAU)*\nСегодня ботом воспользовались: *{dau_count}* чел.", parse_mode="Markdown")
 
 @dp.message(UserState.choosing_group)
 async def process_group(message: types.Message, state: FSMContext):
@@ -285,6 +438,52 @@ async def process_cab(message: types.Message, state: FSMContext):
         _, ru_grp = normalize_group(r['group_name'])
         msg += f"*{r['lesson_num']} пара* ({r['time_str']}) | 👥 *{ru_grp}*\n📖 {r['subject']}\n👤 {r['teacher']}\n---\n"
     await message.answer(msg, parse_mode="Markdown")
+@dp.message(F.text == "🧑‍🏫 Консультации")
+async def ask_teacher(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Введите фамилию и инициалы преподавателя (например: *Иванов И.И.*):",
+        parse_mode="Markdown",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(UserState.waiting_for_teacher)
+
+@dp.message(UserState.waiting_for_teacher)
+async def process_teacher_consultation(message: types.Message, state: FSMContext):
+    teacher_query = message.text
+    await state.clear()
+    
+    await bot.send_chat_action(chat_id=message.chat.id, action='typing')
+    
+    # Получаем и обрабатываем результат
+    result = await fetch_consultations(teacher_query)
+
+    main_keyboard = await get_main_keyboard(message.from_user.id)
+
+    if isinstance(result, str): # Если функция вернула текст ошибки
+        return await message.answer(result, reply_markup=main_keyboard)
+    
+    if not result:
+        return await message.answer(
+            f"😕 Консультации для преподавателя '{teacher_query}' не найдены. Попробуйте ввести только фамилию.",
+            reply_markup=main_keyboard
+        )
+        
+    # Формируем красивое сообщение
+    response_text = f"🧑‍🏫 Найденные консультации по запросу '{teacher_query}':\n\n"
+    for cons in result:
+        response_text += (
+            f"👤 *{cons['teacher']}*\n"
+            f"🗓 День: *{cons['day']}*\n"
+            f"⏰ Время: *{cons['time']}*\n"
+            f"🚪 Кабинет: *{cons['cabinet']}*\n"
+            "--------------------\n"
+        )
+
+    # Защита от слишком длинных сообщений
+    if len(response_text) > 4000:
+        response_text = response_text[:4000] + "\n...(слишком много результатов)..."
+        
+    await message.answer(response_text, parse_mode="Markdown", reply_markup=main_keyboard)
 
 # --- РАСПИСАНИЕ СТУДЕНТА (СОВМЕЩЕНКА) ---
 async def get_user_schedule(message: types.Message, mode: str):
