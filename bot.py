@@ -272,8 +272,7 @@ async def fetch_and_update_all():
 async def fetch_consultations(teacher_query: str):
     """Ищет консультации по фамилии преподавателя (используя pandas для парсинга CSV)"""
     sheet_id = "1xKpaWPKBcv-emcRpAfYRCK767D8dLiYnJjnzvOgBies"
-    gid = "942604599"
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
 
     try:
         # Для асинхронности лучше запускать синхронный pandas в отдельном потоке, 
